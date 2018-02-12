@@ -1,0 +1,813 @@
+diff -ruN nginx-1.4.4-orig/auto/sources nginx-1.4.4/auto/sources
+--- nginx-1.4.4-orig/auto/sources	2013-11-19 15:25:24.000000000 +0400
++++ nginx-1.4.4/auto/sources	2013-12-24 14:19:29.960769471 +0400
+@@ -36,8 +36,11 @@
+            src/core/ngx_conf_file.h \
+            src/core/ngx_resolver.h \
+            src/core/ngx_open_file_cache.h \
+-           src/core/ngx_crypt.h"
+-
++           src/core/ngx_crypt.h \
++           src/core/ngx_jhash.h \
++           src/core/ngx_shmem_palloc.h \
++           src/core/ngx_htable.h \
++           src/core/ngx_ipset.h"
+ 
+ CORE_SRCS="src/core/nginx.c \
+            src/core/ngx_log.c \
+@@ -67,7 +70,11 @@
+            src/core/ngx_conf_file.c \
+            src/core/ngx_resolver.c \
+            src/core/ngx_open_file_cache.c \
+-           src/core/ngx_crypt.c"
++           src/core/ngx_crypt.c \
++           src/core/ngx_jhash.c \
++           src/core/ngx_shmem_palloc.c \
++           src/core/ngx_htable.c \
++           src/core/ngx_ipset.c"
+ 
+ 
+ REGEX_MODULE=ngx_regex_module
+diff -ruN nginx-1.4.4-orig/src/core/ngx_core.h nginx-1.4.4/src/core/ngx_core.h
+--- nginx-1.4.4-orig/src/core/ngx_core.h	2013-11-19 15:25:24.000000000 +0400
++++ nginx-1.4.4/src/core/ngx_core.h	2013-12-24 16:46:05.242822505 +0400
+@@ -77,6 +77,10 @@
+ #include <ngx_open_file_cache.h>
+ #include <ngx_os.h>
+ #include <ngx_connection.h>
++#include <ngx_jhash.h>
++#include <ngx_htable.h>
++#include <ngx_shmem_palloc.h>
++#include <ngx_ipset.h>
+ 
+ 
+ #define LF     (u_char) 10
+diff -ruN nginx-1.4.4-orig/src/core/ngx_htable.c nginx-1.4.4/src/core/ngx_htable.c
+--- nginx-1.4.4-orig/src/core/ngx_htable.c	1970-01-01 03:00:00.000000000 +0300
++++ nginx-1.4.4/src/core/ngx_htable.c	2013-12-24 14:14:58.881952994 +0400
+@@ -0,0 +1,216 @@
++/*
++ * Hash table API: htable
++ */
++
++
++#include <ngx_config.h>
++#include <ngx_core.h>
++
++
++void ngx_hnode_lock(volatile uint8_t *lock);
++void ngx_hbucket_lock(volatile uint8_t *lock);
++
++uint32_t ngx_htable_bsrl(uint32_t x);
++uint8_t  ngx_htable_cmp_and_set (volatile uint8_t *lock, uint8_t old, uint8_t set);
++
++
++
++/* BSR - Bit Scan Reverse 
++ * Return index of most significant bit in argument x
++ */
++uint32_t ngx_htable_bsrl(uint32_t x) {
++         uint32_t r;
++         
++         /*
++          * b - byte
++          * w - 2 bytes
++          * l - 4 bytes
++          * q - 8 bytes
++          */
++
++        __asm__ (
++                   "bsrl %1,%0"
++                   : "=r" (r)
++                   : "rm" (x)
++                   : "cc", "memory"
++                );
++
++         return r;
++}
++
++
++uint8_t ngx_htable_cmp_and_set (volatile uint8_t *lock, uint8_t old, uint8_t set) {
++    u_char  res;
++
++    __asm__ volatile (
++                        "lock;"
++                        "cmpxchg   %3, %1;"
++                        "sete      %0;"
++                        : "=a" (res) 
++                        : "m"  (*lock), "a" (old), "r" (set) 
++                        : "cc", "memory"
++                      );
++
++    return res;
++}
++
++
++
++void ngx_hnode_lock(volatile uint8_t *lock) {
++    ngx_uint_t         i, n;
++
++    for ( ;; ) {
++        //printf ("before: *lock = %02x; (*lock & 1) = %02x; (*lock | 1) = %02x\n", *lock, (*lock & 1), (*lock | 1));
++        if ( ((*lock & 1) == 0) && ngx_htable_cmp_and_set(lock, *lock, (*lock | 1)) ) {
++            //printf ("after: *lock = %02x; (*lock & 1) = %02x; (*lock | 1) = %02x\n", *lock, (*lock & 1), (*lock | 1));
++            return;
++        }
++
++        if (ngx_ncpu > 1) {
++
++            for (n = 1; n < 2048; n <<= 1) {
++
++                for (i = 0; i < n; i++) {
++                    ngx_cpu_pause();
++                }
++
++                if ( ((*lock & 1) == 0) && ngx_htable_cmp_and_set(lock, *lock, (*lock | 1) )) {
++                    return;
++                }
++            }
++        }
++
++        ngx_sched_yield();
++    }
++}
++
++
++
++
++
++void ngx_hbucket_lock(volatile uint8_t *lock) {
++    ngx_uint_t         i, n;
++
++    for ( ;; ) {
++
++        if (*lock == 0 && ngx_htable_cmp_and_set(lock, 0, 1)) {
++            return;
++        }
++
++        if (ngx_ncpu > 1) {
++
++            for (n = 1; n < 2048; n <<= 1) {
++
++                for (i = 0; i < n; i++) {
++                    ngx_cpu_pause();
++                }
++
++                if (*lock == 0 && ngx_htable_cmp_and_set(lock, 0, 1)) {
++                    return;
++                }
++            }
++        }
++
++        ngx_sched_yield();
++    }
++}
++
++
++
++int ngx_htable_init(ngx_htable_t *h) {
++  uint32_t bits;
++  uint32_t size;
++
++  if (!(h->nelts && h->load_factor)) {
++    return -1;
++  }
++
++  h->size = h->nelts/h->load_factor;
++
++  /* number of bits in bucket index */
++  bits = ngx_htable_bsrl(h->size);
++  
++  size = jsize(bits);
++
++  //printf ("bits in bucket index=%u, h->size=%u, size=%u, h->nelts=%u, h->load=%u\n", bits, h->size, size, h->nelts, h->load);
++
++  /* 2^size < h->size < 2^(size+1) */
++  if (h->size > size) {
++    h->size = size << 1;
++  }
++
++  //if (posix_memalign((void *)&h->array, 64, h->size*sizeof(ngx_hbucket_t))) {
++  //    printf ("posix_memalign() error: %s\n", strerror(errno));
++  //    return -2;
++  //}
++
++  //h->array = ngx_slab_alloc(shpool, h->size);
++
++  //memset(h->array, 0, h->size*sizeof(ngx_hbucket_t));
++
++  h->bits    = bits;
++  h->mask    = jmask(bits);
++  h->initval = rand();
++
++  return 0;
++}
++
++
++
++void *ngx_htable_lookup(ngx_htable_t *h, ngx_str_t key) {
++  uint32_t hash;
++  uint32_t i, j;
++  int8_t   n;
++  ngx_hkey_t *node;
++
++  hash = ngx_jhash(key.data, key.len, h->initval);
++  
++  i = hash & h->mask;
++
++  //printf ("hash = %u, bucket index = %u\n", hash, i);
++  printf ("worker with pid %i spining\n", ngx_pid);
++
++  /* If locked - spinig  */
++  ngx_hbucket_lock((volatile uint8_t *) &(h->array[i].state.lock));
++
++  /* Now he we have lock */
++  for (j = 0, n = -1; j < SLOTS; ++j) {
++
++    /* If slot not null */
++    if (h->array[i].slot[j]) {
++
++      node = (ngx_hkey_t *) ((unsigned long int)h->array[i].slot[j] & (unsigned long int) ~1);
++
++      if ((node->len == key.len) && (memcmp(node->key, key.data, key.len) == 0)) {      
++
++        /* Get lock on node */
++        /* We need in spinlock, because other thread can work with this node */
++        /* Because other thread can process same string */        
++        ngx_hnode_lock((volatile uint8_t *) &(h->array[i].slot[j]));
++
++        /* Release lock on bucket */
++        h->array[i].state.lock = 0;
++
++        return &(h->array[i].slot[j]);
++      }
++    }
++
++    else {
++      /* Save index of first empty slot */
++      if (n < 0) {
++        n = j;
++      }
++    }
++  }
++
++  /* If at least one slot empty. n - index of first free slot */
++  if (n >= 0) {   
++    return &(h->array[i].slot[n]);    
++  }
++  
++  /* There is no empty empty slot; collisions > 6 */
++  else {
++    /* Here we will create new bucket, and then create node in int */
++    return (void *) 0;
++  }
++}
+\ No newline at end of file
+diff -ruN nginx-1.4.4-orig/src/core/ngx_htable.h nginx-1.4.4/src/core/ngx_htable.h
+--- nginx-1.4.4-orig/src/core/ngx_htable.h	1970-01-01 03:00:00.000000000 +0300
++++ nginx-1.4.4/src/core/ngx_htable.h	2013-12-24 14:14:58.881952994 +0400
+@@ -0,0 +1,82 @@
++/*
++ * Hash table API: htable
++ */
++
++#ifndef _NGX_HTABLE_H_INCLUDED_
++#define _NGX_HTABLE_H_INCLUDED_
++
++
++#include <ngx_config.h>
++#include <ngx_core.h>
++
++
++/* CACHE_LINE and sizeof(uintptr_t) are constant values for specific arch */
++#define CACHE_LINE 64
++#define SLOT  (sizeof(void *))
++#define AUX   (sizeof(ngx_hbstate_t) + sizeof(void *))
++#define SLOTS ((CACHE_LINE-AUX)/SLOT)
++
++
++
++typedef struct ngx_htable_s      ngx_htable_t;
++typedef struct ngx_hbucket_s     ngx_hbucket_t;
++typedef struct ngx_hbstate_s     ngx_hbstate_t;
++typedef struct ngx_hkey_s        ngx_hkey_t;
++
++
++
++struct ngx_hbstate_s {
++  volatile uint8_t  lock;
++};
++
++
++struct ngx_hbucket_s {
++    ngx_hkey_t    *slot[SLOTS];
++    ngx_hbucket_t *next;
++    ngx_hbstate_t state;
++};
++
++
++struct ngx_hkey_s {
++    void         *val;
++    uint32_t     len;
++    ngx_msec_t   start_time_ms;
++    ngx_msec_t   last_time_ms;
++    uint8_t      key[1];
++};
++
++
++/*
++ * array            - ptr to array of buckets
++ * load             - alowed load factor
++ * nelts            - suggested number of elements in htable from config file
++ * nelts_cur        - current number of elements in htable
++ * bits             - length of bucket's index in bits
++ * mask             - mask = (2^bits - 1), mask is used for getting bucket index by hash
++ * bad_buckets      - numbers of bad buckets, where collisions > 6
++ * total_collisions - current number of all collisions in htable (number of buckets where more than one element)
++ * size             - number of buckets in array of buckets
++ * initval          - third constant per whole table argument for jhash()
++ */
++struct ngx_htable_s {
++    ngx_hbucket_t     *array;      
++    uint32_t          size;    
++    uint32_t          load_factor;            
++    uint32_t          nelts;           
++    uint32_t          nelts_cur;  
++    uint32_t          bits;            
++    uint32_t          mask;            
++    uint32_t          total_collisions;
++    uint32_t          bad_buckets;                         
++    uint32_t          initval;       
++    //ngx_slab_pool_t   *shpool; 
++};
++
++
++
++int ngx_htable_init(ngx_htable_t *h);
++void *ngx_htable_lookup(ngx_htable_t *h, ngx_str_t key);
++
++
++
++#endif /* _NGX_HTABLE_H_INCLUDED_ */
+\ No newline at end of file
+diff -ruN nginx-1.4.4-orig/src/core/ngx_ipset.c nginx-1.4.4/src/core/ngx_ipset.c
+--- nginx-1.4.4-orig/src/core/ngx_ipset.c	1970-01-01 03:00:00.000000000 +0300
++++ nginx-1.4.4/src/core/ngx_ipset.c	2013-12-24 14:14:58.881952994 +0400
+@@ -0,0 +1,37 @@
++#include <ngx_config.h>
++#include <ngx_core.h>
++
++
++static uint64_t spaces_64 = 0x2020202020202020;  // spaces
++static uint32_t spaces_32 = 0x20202020;          // spaces
++
++
++void ngx_ipset_add(ngx_str_t *cmd, ngx_str_t *ip) {            
++  u_char i, *offset;
++  size_t word;
++
++  word = sizeof(long unsigned int);
++  
++  offset = cmd->data + (cmd->len - (sizeof("xxx.xxx.xxx.xxx timeout ttttttttt 1>&2 2>/dev/null") - 1));
++
++  /* Erase old chars */
++  if (word == 4) {
++    for (i = 0; i < 16/word; ++i){
++      *((long unsigned int *)offset + i) = spaces_32;
++    }
++  }
++
++  else if (word == 8) {
++    for (i = 0; i < 16/word; ++i){
++      *((long unsigned int *)offset + i) = spaces_64;
++    }    
++  }
++
++  /* Write ip to cmd buffer */
++  ngx_memcpy(offset, ip->data, ip->len);
++
++  system((char *) cmd->data);
++
++  return;
++}
++
+diff -ruN nginx-1.4.4-orig/src/core/ngx_ipset.h nginx-1.4.4/src/core/ngx_ipset.h
+--- nginx-1.4.4-orig/src/core/ngx_ipset.h	1970-01-01 03:00:00.000000000 +0300
++++ nginx-1.4.4/src/core/ngx_ipset.h	2013-12-24 14:14:58.885953040 +0400
+@@ -0,0 +1,12 @@
++#ifndef _NGX_IPSET_H_INCLUDED_
++#define _NGX_IPSET_H_INCLUDED_
++
++
++#include <ngx_config.h>
++#include <ngx_core.h>
++
++
++void ngx_ipset_add(ngx_str_t *cmd, ngx_str_t *ip);
++
++
++#endif /* _NGX_IPSET_H_INCLUDED_ */
+\ No newline at end of file
+diff -ruN nginx-1.4.4-orig/src/core/ngx_jhash.c nginx-1.4.4/src/core/ngx_jhash.c
+--- nginx-1.4.4-orig/src/core/ngx_jhash.c	1970-01-01 03:00:00.000000000 +0300
++++ nginx-1.4.4/src/core/ngx_jhash.c	2013-12-24 14:14:58.885953040 +0400
+@@ -0,0 +1,104 @@
++/*
++ * Bob Jenkins hashing alghoritm,
++ * http://burtleburtle.net/bob/c/lookup3.c
++ *
++ * I took 2 parts of code from lookup3.c:
++ *
++ *   if (HASH_LITTLE_ENDIAN && ((u.i & 0x3) == 0)) {
++ *
++ *      PART1
++ *     
++ *     #ifndef VALGRIND
++ *     
++ *      PART2
++ *     
++ *     #else
++ *   }
++ *
++ *   final(a,b,c);
++ *   return c;
++ */
++
++
++#include <ngx_config.h>
++#include <ngx_core.h>
++
++
++
++uint32_t ngx_jhash(const void *key, size_t length, uint32_t initval) {
++  uint32_t a, b, c;
++
++  /* pointer *key must be aligned on 32 bit */
++  const uint32_t *k = key;
++
++  /* Set up the internal state */
++  a = b = c = 0xdeadbeef + ((uint32_t)length) + initval;
++
++  while (length > 12) {
++      a += k[0];
++      b += k[1];
++      c += k[2];
++
++      mix(a,b,c);
++
++      k += 3;
++      length -= 12;
++  }
++
++  switch(length) {
++    case 12: 
++        c+=k[2]; 
++        b+=k[1]; 
++        a+=k[0]; 
++        break;
++    case 11: 
++        c+=k[2]&0xffffff; 
++        b+=k[1]; 
++        a+=k[0]; 
++        break;
++    case 10: 
++        c+=k[2]&0xffff; 
++        b+=k[1]; 
++        a+=k[0]; 
++        break;
++    case 9: 
++        c+=k[2]&0xff; 
++        b+=k[1]; 
++        a+=k[0]; 
++        break;
++    case 8: 
++        b+=k[1]; 
++        a+=k[0]; 
++        break;
++    case 7: 
++        b+=k[1]&0xffffff; 
++        a+=k[0]; 
++        break;
++    case 6: 
++        b+=k[1]&0xffff; 
++        a+=k[0]; 
++        break;
++    case 5: 
++        b+=k[1]&0xff; 
++        a+=k[0]; 
++        break;
++    case 4: 
++        a+=k[0]; 
++        break;
++    case 3: 
++        a+=k[0]&0xffffff; 
++        break;
++    case 2: 
++        a+=k[0]&0xffff; 
++        break;
++    case 1: 
++        a+=k[0]&0xff; 
++        break;
++    case 0: 
++        return c;  /* zero length strings require no mixing */
++  } 
++
++  final(a,b,c);
++
++  return c;
++}
+diff -ruN nginx-1.4.4-orig/src/core/ngx_jhash.h nginx-1.4.4/src/core/ngx_jhash.h
+--- nginx-1.4.4-orig/src/core/ngx_jhash.h	1970-01-01 03:00:00.000000000 +0300
++++ nginx-1.4.4/src/core/ngx_jhash.h	2013-12-24 14:14:58.885953040 +0400
+@@ -0,0 +1,45 @@
++/*
++ * Bob Jenkins hashing alghoritm,
++ * http://burtleburtle.net/bob/c/lookup3.c
++ */
++
++#ifndef _NGX_JHASH_H_INCLUDED_
++#define _NGX_JHASH_H_INCLUDED_
++
++
++#include <ngx_config.h>
++#include <ngx_core.h>
++
++
++
++/* Jenkins specicifc MACROS */
++#define jsize(n) ((uint32_t)1<<(n))
++#define jmask(n) (jsize(n)-1)
++#define rot(x,k) (((x)<<(k)) | ((x)>>(32-(k))))
++
++#define mix(a,b,c) \
++{ \
++  a -= c;  a ^= rot(c, 4);  c += b; \
++  b -= a;  b ^= rot(a, 6);  a += c; \
++  c -= b;  c ^= rot(b, 8);  b += a; \
++  a -= c;  a ^= rot(c,16);  c += b; \
++  b -= a;  b ^= rot(a,19);  a += c; \
++  c -= b;  c ^= rot(b, 4);  b += a; \
++}
++
++#define final(a,b,c) \
++{ \
++  c ^= b; c -= rot(b,14); \
++  a ^= c; a -= rot(c,11); \
++  b ^= a; b -= rot(a,25); \
++  c ^= b; c -= rot(b,16); \
++  a ^= c; a -= rot(c,4);  \
++  b ^= a; b -= rot(a,14); \
++  c ^= b; c -= rot(b,24); \
++}
++
++
++uint32_t ngx_jhash(const void *key, size_t length, uint32_t initval);
++
++
++#endif /* _NGX_JHASH_H_INCLUDED_ */
+\ No newline at end of file
+diff -ruN nginx-1.4.4-orig/src/core/ngx_shmem_palloc.c nginx-1.4.4/src/core/ngx_shmem_palloc.c
+--- nginx-1.4.4-orig/src/core/ngx_shmem_palloc.c	1970-01-01 03:00:00.000000000 +0300
++++ nginx-1.4.4/src/core/ngx_shmem_palloc.c	2013-12-24 14:14:58.889953094 +0400
+@@ -0,0 +1,215 @@
++/*
++ * Pool allocator on 
++ * shared memory segment 
++ */
++
++
++#include <ngx_config.h>
++#include <ngx_core.h>
++
++
++static void *ngx_shmem_palloc_block(ngx_slab_pool_t *spool, ngx_pool_t *pool, size_t size);
++static void *ngx_shmem_palloc_large(ngx_slab_pool_t *spool, ngx_pool_t *pool, size_t size);
++
++
++ngx_pool_t *ngx_shmem_create_pool(ngx_slab_pool_t *spool, size_t size, ngx_log_t *log) {
++    ngx_pool_t  *p;
++
++    p = ngx_slab_alloc_locked(spool, size);
++
++    if (p == NULL) {
++        return NULL;
++    }
++
++    p->d.last = (u_char *) p + sizeof(ngx_pool_t);
++    p->d.end = (u_char *) p + size;
++    p->d.next = NULL;
++    p->d.failed = 0;
++
++    size = size - sizeof(ngx_pool_t);
++    p->max = (size < NGX_MAX_ALLOC_FROM_POOL) ? size : NGX_MAX_ALLOC_FROM_POOL;
++
++    p->current = p;
++    p->chain = NULL;
++    p->large = NULL;
++    p->cleanup = NULL;
++    p->log = log;
++
++    return p;
++}
++
++
++void ngx_shmem_destroy_pool(ngx_slab_pool_t *spool, ngx_pool_t *pool){
++    ngx_pool_t          *p, *n;
++    ngx_pool_large_t    *l;
++    ngx_pool_cleanup_t  *c;
++
++    for (c = pool->cleanup; c; c = c->next) {
++        if (c->handler) {
++            ngx_log_debug1(NGX_LOG_DEBUG_ALLOC, pool->log, 0,
++                           "run pool->cleanup in ngx_shmem_destroy_pool(): %p", c);
++            c->handler(c->data);
++        }
++    }
++
++    for (l = pool->large; l; l = l->next) {
++
++        ngx_log_debug1(NGX_LOG_DEBUG_ALLOC, pool->log, 0, "ngx_slab_free_locked(): %p", l->alloc);
++
++        if (l->alloc) {
++            ngx_slab_free_locked(spool, l->alloc);
++        }
++    }
++
++#if (NGX_DEBUG)
++
++    /*
++     * we could allocate the pool->log from this pool
++     * so we cannot use this log while free()ing the pool
++     */
++
++    for (p = pool, n = pool->d.next; /* void */; p = n, n = n->d.next) {
++        ngx_log_debug2(NGX_LOG_DEBUG_ALLOC, pool->log, 0,
++                       "ngx_slab_free_locked(): %p, unused: %uz", p, p->d.end - p->d.last);
++
++        if (n == NULL) {
++            break;
++        }
++    }
++
++#endif
++
++    for (p = pool, n = pool->d.next; /* void */; p = n, n = n->d.next) {
++        ngx_slab_free_locked(spool, p);
++
++        if (n == NULL) {
++            break;
++        }
++    }
++}
++
++
++void *ngx_shmem_palloc(ngx_slab_pool_t *spool, ngx_pool_t *pool, size_t size) {
++    u_char      *m;
++    ngx_pool_t  *p;
++
++    if (size <= pool->max) {
++
++        p = pool->current;
++
++        do {
++            m = ngx_align_ptr(p->d.last, NGX_ALIGNMENT);
++
++            if ((size_t) (p->d.end - m) >= size) {
++                p->d.last = m + size;
++
++                return m;
++            }
++
++            p = p->d.next;
++
++        } while (p);
++
++        return ngx_shmem_palloc_block(spool, pool, size);
++    }
++
++    return ngx_shmem_palloc_large(spool, pool, size);
++}
++
++
++ngx_int_t ngx_shmem_pfree(ngx_slab_pool_t *spool, ngx_pool_t *pool, void *p){
++    ngx_pool_large_t  *l;
++
++    for (l = pool->large; l; l = l->next) {
++        if (p == l->alloc) {
++            ngx_log_debug1(NGX_LOG_DEBUG_ALLOC, pool->log, 0,
++                           "free: %p", l->alloc);
++            ngx_slab_free_locked(spool, l->alloc);
++            l->alloc = NULL;
++
++            return NGX_OK;
++        }
++    }
++
++    return NGX_DECLINED;    
++}
++
++
++
++static void *
++ngx_shmem_palloc_block(ngx_slab_pool_t *spool, ngx_pool_t *pool, size_t size)
++{
++    u_char      *m;
++    size_t       psize;
++    ngx_pool_t  *p, *new, *current;
++
++    psize = (size_t) (pool->d.end - (u_char *) pool);
++
++    m = ngx_slab_alloc_locked(spool, size);
++
++    if (m == NULL) {
++        return NULL;
++    }
++
++    new = (ngx_pool_t *) m;
++
++    new->d.end = m + psize;
++    new->d.next = NULL;
++    new->d.failed = 0;
++
++    m += sizeof(ngx_pool_data_t);
++    m = ngx_align_ptr(m, NGX_ALIGNMENT);
++    new->d.last = m + size;
++
++    current = pool->current;
++
++    for (p = current; p->d.next; p = p->d.next) {
++        if (p->d.failed++ > 4) {
++            current = p->d.next;
++        }
++    }
++
++    p->d.next = new;
++
++    pool->current = current ? current : new;
++
++    return m;
++}
++
++
++
++static void *ngx_shmem_palloc_large(ngx_slab_pool_t *spool, ngx_pool_t *pool, size_t size) {
++    void              *p;
++    ngx_uint_t         n;
++    ngx_pool_large_t  *large;
++
++    p = ngx_slab_alloc_locked(spool, size);
++    if (p == NULL) {
++        return NULL;
++    }
++
++    n = 0;
++
++    for (large = pool->large; large; large = large->next) {
++        if (large->alloc == NULL) {
++            large->alloc = p;
++            return p;
++        }
++
++        if (n++ > 3) {
++            break;
++        }
++    }
++
++    large = ngx_slab_alloc_locked(spool, sizeof(ngx_pool_large_t));
++    if (large == NULL) {
++        ngx_shmem_pfree(spool, pool, p);
++        return NULL;
++    }
++
++    large->alloc = p;
++    large->next = pool->large;
++    pool->large = large;
++
++    return p;
++}
+\ No newline at end of file
+diff -ruN nginx-1.4.4-orig/src/core/ngx_shmem_palloc.h nginx-1.4.4/src/core/ngx_shmem_palloc.h
+--- nginx-1.4.4-orig/src/core/ngx_shmem_palloc.h	1970-01-01 03:00:00.000000000 +0300
++++ nginx-1.4.4/src/core/ngx_shmem_palloc.h	2013-12-24 14:14:58.889953094 +0400
+@@ -0,0 +1,20 @@
++/*
++ * Pool allocator on 
++ * shared memory segment 
++ */
++
++#ifndef _NGX_SHMEM_PALLOC_H_INCLUDED_
++#define _NGX_SHMEM_PALLOC_INCLUDED_
++
++
++#include <ngx_config.h>
++#include <ngx_core.h>
++
++
++ngx_pool_t *ngx_shmem_create_pool(ngx_slab_pool_t *spool, size_t size, ngx_log_t *log);
++void ngx_shmem_destroy_pool(ngx_slab_pool_t *spool, ngx_pool_t *pool);
++void *ngx_shmem_palloc(ngx_slab_pool_t *spool, ngx_pool_t *pool, size_t size);
++ngx_int_t ngx_shmem_pfree(ngx_slab_pool_t *spool, ngx_pool_t *pool, void *p);
++
++
++#endif /* _NGX_SHMEM_PALLOC_H_INCLUDED_ */
+\ No newline at end of file

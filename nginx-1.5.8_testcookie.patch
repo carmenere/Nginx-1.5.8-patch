@@ -1,0 +1,147 @@
+--- ngx_http_testcookie_filter_module.c-orig	2013-12-30 14:20:08.964712638 +0400
++++ ngx_http_testcookie_filter_module.c	2013-12-30 14:21:25.664711579 +0400
+@@ -67,6 +67,7 @@
+     ngx_flag_t                  get_only;
+     ngx_flag_t                  deny_keepalive;
+     ngx_flag_t                  internal;
++    ngx_str_t                   ipset_cmd;
+ } ngx_http_testcookie_conf_t;
+ 
+ 
+@@ -123,6 +124,8 @@
+ static char *ngx_http_testcookie_set_encryption_iv(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
+ #endif
+ 
++static char *ngx_http_testcookie_ipset(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
++
+ static u_char expires[] = "; expires=Thu, 31-Dec-37 23:55:55 GMT";
+ 
+ static u_char ngx_http_msie_refresh_head[] =
+@@ -290,6 +293,13 @@
+ 
+ #endif
+ 
++    { ngx_string("testcookie_ipset"),
++      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE2,
++      ngx_http_testcookie_ipset,
++      NGX_HTTP_LOC_CONF_OFFSET,
++      0,
++      NULL },
++
+       ngx_null_command
+ };
+ 
+@@ -581,9 +591,23 @@
+ 
+         if (conf->max_attempts > 0 && attempt >= conf->max_attempts) {
+             r->keepalive = 0;
++
++            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "testcookie: max_attempts exeeded");
++
+             if (conf->fallback.len == 0) {
++              if (conf->ipset_cmd.data == NULL) {
++                ngx_log_error(NGX_LOG_EMERG, r->connection->log, 0,
++                                   "testcookie, forbid_action:return_403_err");
++                return NGX_HTTP_FORBIDDEN;
++              }
++              else {
++                ngx_log_error(NGX_LOG_EMERG, r->connection->log, 0,
++                                   "testcookie, forbid_action:ipset");
++                ngx_ipset_add(&conf->ipset_cmd, &r->connection->addr_text);
+                 return NGX_HTTP_FORBIDDEN;
++              }
+             }
++
+             if (conf->fallback_lengths != NULL && conf->fallback_values != NULL) {
+                 if (ngx_http_script_run(r, &compiled_fallback, conf->fallback_lengths->elts,
+                                         0, conf->fallback_values->elts) == NULL) {
+@@ -1521,6 +1545,8 @@
+         conf->session_key = prev->session_key;
+     }
+ 
++    ngx_conf_merge_str_value(conf->ipset_cmd, prev->ipset_cmd, NULL);
++
+     ngx_conf_merge_value(conf->redirect_to_https, prev->redirect_to_https, 0);
+     ngx_conf_merge_value(conf->get_only, prev->get_only, 0);
+     ngx_conf_merge_value(conf->deny_keepalive, prev->deny_keepalive, 0);
+@@ -2040,7 +2066,7 @@
+             return NGX_CONF_ERROR;
+         }
+     }
+-    
++
+     return NGX_CONF_ERROR;
+ }
+ 
+@@ -2072,3 +2098,71 @@
+ 
+     return dst;
+ }
++
++
++
++
++static char *ngx_http_testcookie_ipset(ngx_conf_t *cf, ngx_command_t *cmd, void *conf) {
++    ngx_http_testcookie_conf_t  *ucf = conf;
++    ngx_str_t                   *value, timeout, setname;
++    ngx_uint_t                  i;
++    u_char                      *ipset_cmd;
++
++    value = cf->args->elts;
++
++    ipset_cmd = NULL;
++    ngx_str_null(&setname);
++    ngx_str_null(&timeout);
++
++    for (i = 1; i < cf->args->nelts; i++) {
++        if (ngx_strncmp(value[i].data, "timeout=", 8) == 0) {
++
++            timeout.data = value[i].data + 8;
++            timeout.len = value[i].len - 8;
++
++            continue;
++        }
++
++        if (ngx_strncmp(value[i].data, "setname=", 8) == 0) {
++
++            setname.data = value[i].data + 8;
++            setname.len = value[i].len - 8;
++
++            continue;
++        }
++    }
++
++    if (setname.data == NULL) {
++        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
++                           "\"%V\" must have \"setname\" parameter",
++                           &cmd->name);
++        return NGX_CONF_ERROR;
++    }
++
++    ucf->ipset_cmd.len  = sizeof("ipset add  xxx.xxx.xxx.xxx timeout ttttttttt") + setname.len - 1; // without last byte
++    ucf->ipset_cmd.data = ngx_pcalloc(cf->pool, ucf->ipset_cmd.len + 1);  // with last byte
++
++    if (ucf->ipset_cmd.data == NULL) {
++      return NGX_CONF_ERROR;
++    }
++
++    ipset_cmd = ucf->ipset_cmd.data;
++
++    ngx_memcpy(ipset_cmd, "ipset add ", (sizeof("ipset add ") - 1)); 
++    ipset_cmd += (sizeof("ipset add ") - 1);
++
++    ngx_memcpy(ipset_cmd, setname.data, setname.len); 
++    ipset_cmd += setname.len;
++
++    ngx_memcpy(ipset_cmd, "                 timeout ", (sizeof(" xxx.xxx.xxx.xxx timeout ") - 1)); 
++    ipset_cmd += (sizeof(" xxx.xxx.xxx.xxx timeout ") - 1);
++
++    if (timeout.data) {
++      ngx_memcpy(ipset_cmd, timeout.data, timeout.len);
++    }
++    else {
++      ngx_memcpy(ipset_cmd, "10800", (sizeof("10800") - 1));
++    }
++
++    return NGX_CONF_OK;
++}
